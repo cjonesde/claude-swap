@@ -129,14 +129,18 @@ def _format_usage_lines(usage: dict, fetched_at: float | None = None) -> list[st
     rows: list[tuple[str, str]] = []
     spend = usage.get("spend")
     if spend:
-        used = spend["used"]
-        limit = spend["limit"]
         pct = spend["pct"]
+        amounts = oauth.spend_amounts(spend)
         cell = oauth.fresh_reset_strings(spend)
+        segments: list[str] = []
         if cell:
-            rows.append(("$$", f"{pct:>3.0f}%   resets {cell[1]:<12}  ${used:,.2f} / ${limit:,.2f}"))
-        else:
-            rows.append(("$$", f"{pct:>3.0f}%   ${used:,.2f} / ${limit:,.2f}"))
+            segments.append(f"resets {cell[1]:<12}" if amounts else f"resets {cell[1]}")
+        if amounts:
+            segments.append(amounts)
+        body = f"{pct:>3.0f}%"
+        if segments:
+            body += "   " + "  ".join(segments)
+        rows.append(("$$", body))
     for label, w in (("5h", usage.get("five_hour")), ("7d", usage.get("seven_day"))):
         if w:
             # Pace only applies to the weekly (7d) window, never 5h (issue #125).

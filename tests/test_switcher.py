@@ -6250,6 +6250,23 @@ class TestFormatUsageLines:
         assert f"resets {expected_clock}" in line
         assert "stale-clock" not in line
 
+    def test_a_spend_entry_with_no_money_line_renders_its_percentage(self):
+        """A probe-sourced spend entry has a utilization and no credit
+        amounts (the overage response headers carry no dollar figures), so
+        the dollar line is omitted rather than indexed into a KeyError."""
+        usage = {
+            "spend": {"pct": 106.0, "status": "rejected"},
+            "seven_day": {"pct": 100.0},
+        }
+        lines = _format_usage_lines(usage)
+        assert lines[0] == "$$: 106%"
+        assert lines[1] == "7d: 100%"
+
+    def test_a_spend_entry_with_a_money_line_is_unchanged(self):
+        usage = {"spend": {"used": 1.0, "limit": 10.0, "pct": 10.0,
+                           "currency": "USD"}}
+        assert _format_usage_lines(usage)[0] == "$$:  10%   $1.00 / $10.00"
+
     def test_no_scoped_key_renders_only_standard_windows(self):
         usage = {"five_hour": {"pct": 7.0}, "seven_day": {"pct": 72.0}}
         lines = _format_usage_lines(usage)

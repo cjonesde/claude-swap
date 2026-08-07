@@ -328,6 +328,24 @@ def fresh_reset_strings(window: dict) -> tuple[str, str] | None:
     return None
 
 
+def spend_amounts(spend: dict) -> str:
+    """``"$12.50 / $50.00"`` for a spend entry with a money line, else ``""``.
+
+    The money line is optional (see :func:`_spend_entry`): the unified
+    rate-limit response headers report the spend axis as a utilization with
+    no credit amounts, so a probe-sourced entry carries a percentage and
+    nothing to denominate it in. Every display surface renders the
+    percentage alone in that case, which is why this returns a string
+    instead of leaving each caller to index ``used``/``limit`` and raise on
+    a probed account.
+    """
+    used = spend.get("used")
+    limit = spend.get("limit")
+    if used is None or limit is None:
+        return ""
+    return f"${used:,.2f} / ${limit:,.2f}"
+
+
 def request_usage_data(access_token: str) -> dict:
     """Request raw utilization data from the Anthropic usage API."""
     url = "https://api.anthropic.com/api/oauth/usage"
@@ -395,6 +413,66 @@ def _log_usage_failure(
 
 
 
+def _spend_entry(eu: dict) -> dict | None:
+    """Normalize one ``extra_usage`` payload into the ``spend`` entry, or None.
+
+    The entry has two independent halves, because the two sources that reach
+    here know different things about the same axis:
+
+    - the money line, ``used``/``limit``/``currency``, needs both credit
+      figures. Claude Code returns them nullable and a null ``monthly_limit``
+      means unlimited, so a payload missing either has no dollar line to draw
+      and simply omits those three keys.
+    - the utilization axis, ``pct`` plus ``status``/``disabled_reason`` when
+      the source reports them, is what :func:`spend_headroom` reads. ``pct``
+      is a percentage and goes over 100 once overage is capped.
+
+    ``GET /api/oauth/usage`` reports the money line and no status.
+    ``unified_headers.parse_unified_headers`` reports the reverse: the
+    ``anthropic-ratelimit-unified-overage-*`` response headers carry
+    utilization, status and disabled reason but no credit amounts, which is
+    why the money line had to become optional for issue #194 to reach a
+    probe-sourced account at all.
+
+    An entry must carry one half or the other to be worth recording, so a
+    payload whose only fact is a bare percentage stays None exactly as it did
+    before the header source existed (measured shapes: a null
+    ``monthly_limit`` on an unlimited plan, and a null ``used_credits``
+    alongside a real limit). ``utilization: None`` is None outright: it is the
+    endpoint's own way of saying the axis is unreadable, and an unreadable
+    spend axis must never be promoted to a rotation target.
+    """
+    if eu.get("utilization") is None:
+        return None
+    try:
+        entry: dict = {"pct": float(eu["utilization"])}
+        used_credits = eu.get("used_credits")
+        monthly_limit = eu.get("monthly_limit")
+        if used_credits is not None and monthly_limit is not None:
+            entry["used"] = float(used_credits) / 100
+            entry["limit"] = float(monthly_limit) / 100
+            entry["currency"] = eu.get("currency", "USD")
+        status = eu.get("status")
+        if isinstance(status, str) and status:
+            entry["status"] = status
+        reason = eu.get("disabled_reason")
+        if isinstance(reason, str) and reason:
+            entry["disabled_reason"] = reason
+        if (
+            "used" not in entry
+            and "status" not in entry
+            and "disabled_reason" not in entry
+        ):
+            return None
+        if eu.get("resets_at"):
+            entry["resets_at"] = eu["resets_at"]
+            entry["countdown"], entry["clock"] = format_reset(eu["resets_at"])
+    except (TypeError, ValueError) as e:
+        _logger.debug("extra_usage parse failed: %r", e)
+        return None
+    return entry
+
+
 def build_usage_result(data: dict) -> dict | None:
     """Normalize raw usage API data into the structure used by the CLI.
 
@@ -441,27 +519,9 @@ def build_usage_result(data: dict) -> dict | None:
 
     eu = data.get("extra_usage")
     if eu and eu.get("is_enabled"):
-        # Claude Code returns nullable used_credits, monthly_limit, and utilization
-        # (monthly_limit=None = unlimited). All three are needed to render the spend
-        # line, so when any is null skip just the spend entry; five_hour/seven_day
-        # go through unchanged.
-        used_credits = eu.get("used_credits")
-        monthly_limit = eu.get("monthly_limit")
-        utilization = eu.get("utilization")
-        if used_credits is not None and monthly_limit is not None and utilization is not None:
-            try:
-                spend_entry: dict = {
-                    "used": float(used_credits) / 100,
-                    "limit": float(monthly_limit) / 100,
-                    "pct": float(utilization),
-                    "currency": eu.get("currency", "USD"),
-                }
-                if eu.get("resets_at"):
-                    spend_entry["resets_at"] = eu["resets_at"]
-                    spend_entry["countdown"], spend_entry["clock"] = format_reset(eu["resets_at"])
-                result["spend"] = spend_entry
-            except (TypeError, ValueError) as e:
-                _logger.debug("extra_usage parse failed: %r", e)
+        spend_entry = _spend_entry(eu)
+        if spend_entry is not None:
+            result["spend"] = spend_entry
 
     # Per-model weekly limits live in the newer ``limits`` array as
     # ``weekly_scoped`` entries carrying a ``scope.model.display_name`` (e.g.
@@ -553,14 +613,25 @@ def account_headroom(
 def spend_headroom(usage: dict | None) -> float | None:
     """Remaining percentage before this account's pay-as-you-go spend cap.
 
-    Reads the ``spend`` entry :func:`build_usage_result` derives from
-    ``extra_usage``: ``pct`` there is the utilization the API already
-    reports, over 100 once overage is capped (this machine measured 106%
-    alongside an ``overage-disabled-reason`` of ``org_spend_cap_reached``,
-    so a >=100 reading already means "rejected", not "nearly there" -- no
-    separate capped/disabled signal is consulted or needed). Returns
-    ``None`` when no ``spend`` entry exists, which callers must treat as
-    unknown: never as capped, and never as available. Unlike
+    Reads the ``spend`` entry :func:`_spend_entry` builds from an
+    ``extra_usage`` payload, whichever source reported it: the usage
+    endpoint, or the unified response headers a probe read off
+    ``POST /v1/messages`` (issue #220 makes the probe the only source for a
+    busy account, which is exactly the account issue #194 cares about).
+    ``pct`` is the utilization the source reported, and goes over 100 once
+    overage is capped -- this machine measured ``overage-utilization: 1.06``,
+    i.e. 106%, on an account whose overage was also ``rejected`` with
+    ``org_spend_cap_reached``.
+
+    ``status`` and ``disabled_reason`` are independent of that number, and
+    both veto it: an org can reject overage at any utilization at all, so a
+    rejected or disabled axis is clamped to at most zero headroom. Reading
+    the percentage alone would let such an account be promoted to a rotation
+    target on the strength of a low number while the server refuses every
+    request it would send there.
+
+    Returns ``None`` when no ``spend`` entry exists, which callers must treat
+    as unknown: never as capped, and never as available. Unlike
     :func:`account_headroom`, spend is not one of the windows that gates
     ordinary requests (see that function's docstring); it exists so a
     caller can ask, as a last resort once every 5h/7d candidate is already
@@ -572,7 +643,10 @@ def spend_headroom(usage: dict | None) -> float | None:
     spend = usage.get("spend")
     if not isinstance(spend, dict) or not isinstance(spend.get("pct"), (int, float)):
         return None
-    return 100.0 - float(spend["pct"])
+    headroom = 100.0 - float(spend["pct"])
+    if spend.get("status") == "rejected" or spend.get("disabled_reason"):
+        return min(0.0, headroom)
+    return headroom
 
 
 @dataclass(frozen=True)

@@ -35,6 +35,7 @@ from claude_swap.usage_store import FetchRecord, UsageEntry
 from claude_swap.models import Platform
 from claude_swap.settings import AutoSwitchSettings
 from claude_swap.switcher import ClaudeAccountSwitcher
+from claude_swap.unified_headers import parse_unified_headers
 
 
 class FakeClock:
@@ -3470,6 +3471,74 @@ class TestEveryAccountAboveThreshold:
             "2": usage_2,
             "3": _usage(100, self._at(harness, 900)),
         })
+        assert outcome is TickOutcome.BLOCKED
+        assert harness.active_number() == 1
+        assert any(isinstance(e, AllExhaustedEvent) for e in harness.events)
+
+    def _all_at_limit_with(self, harness, probed):
+        return harness.tick_with_usage({
+            "1": _usage(100, self._at(harness, 600)),
+            "2": probed,
+            "3": _usage(100, self._at(harness, 900)),
+        })
+
+    def test_probe_sourced_spend_reaches_the_last_resort_tier(self, harness):
+        """#194 through its real source. Issue #220 leaves the header probe
+        as the only usage source a subscription-exhausted account has, so
+        until the overage headers produced a ``spend`` entry the tier could
+        not fire in the one scenario it was written for. Header values are
+        fractions: 0.3 is 30% of the credit spent, 70 points left."""
+        probed = parse_unified_headers({
+            "anthropic-ratelimit-unified-7d-utilization": "1.0",
+            "anthropic-ratelimit-unified-overage-status": "allowed",
+            "anthropic-ratelimit-unified-overage-utilization": "0.3",
+        })
+        assert oauth.spend_headroom(probed) == 70.0
+        outcome = self._all_at_limit_with(harness, probed)
+        assert outcome is TickOutcome.SWITCHED
+        assert harness.active_number() == 2
+        assert not any(isinstance(e, AllExhaustedEvent) for e in harness.events)
+
+    def test_a_probed_spend_capped_account_stays_excluded(self, harness):
+        """The safety half, from this machine's captured headers: overage
+        utilization 1.06 and rejected with org_spend_cap_reached. Exhausted
+        on both axes, so it cannot serve the request a switch would send it,
+        and selecting it would be worse than the dead-tier bug."""
+        probed = parse_unified_headers({
+            "anthropic-ratelimit-unified-7d-utilization": "1.0",
+            "anthropic-ratelimit-unified-overage-status": "rejected",
+            "anthropic-ratelimit-unified-overage-utilization": "1.06",
+            "anthropic-ratelimit-unified-overage-disabled-reason":
+                "org_spend_cap_reached",
+        })
+        outcome = self._all_at_limit_with(harness, probed)
+        assert outcome is TickOutcome.BLOCKED
+        assert harness.active_number() == 1
+        assert any(isinstance(e, AllExhaustedEvent) for e in harness.events)
+
+    def test_a_rejected_overage_with_room_on_the_number_stays_excluded(
+        self, harness
+    ):
+        """Status is an independent signal: 30% spent, yet the org rejects
+        overage. Reading the percentage alone would rotate work onto an
+        account the server refuses."""
+        probed = parse_unified_headers({
+            "anthropic-ratelimit-unified-7d-utilization": "1.0",
+            "anthropic-ratelimit-unified-overage-status": "rejected",
+            "anthropic-ratelimit-unified-overage-utilization": "0.3",
+        })
+        outcome = self._all_at_limit_with(harness, probed)
+        assert outcome is TickOutcome.BLOCKED
+        assert harness.active_number() == 1
+
+    def test_a_probe_with_no_overage_headers_is_unchanged(self, harness):
+        """The third state: no spend data at all. Unknown must stay unknown,
+        so behaviour matches the pre-#194 exhausted path exactly."""
+        probed = parse_unified_headers({
+            "anthropic-ratelimit-unified-7d-utilization": "1.0",
+        })
+        assert oauth.spend_headroom(probed) is None
+        outcome = self._all_at_limit_with(harness, probed)
         assert outcome is TickOutcome.BLOCKED
         assert harness.active_number() == 1
         assert any(isinstance(e, AllExhaustedEvent) for e in harness.events)

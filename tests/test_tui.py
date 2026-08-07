@@ -520,6 +520,15 @@ class TestUsageRows:
         assert rows[0][0] == "$$"
         assert "$12.50 / $50.00" in rows[0][2]
 
+    def test_spend_row_without_amounts_keeps_its_percentage(self):
+        """A probe-sourced spend entry reports a utilization and no credit
+        amounts, so the row is the bare percentage instead of a KeyError."""
+        from claude_swap.tui.widgets import usage_rows
+
+        entry = make_entry(spend={"pct": 106.0, "status": "rejected"})
+        rows = usage_rows(entry.last_good, time.time())
+        assert rows[0] == ("$$", 106.0, "", "")
+
     def test_suffix_full_extends_countdown_with_clock(self):
         from claude_swap.tui.widgets import usage_rows
 

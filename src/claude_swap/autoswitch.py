@@ -622,12 +622,14 @@ def _spend_last_resort_candidates(
     "everything is at its limit" case from a false ``AllExhausted``.
 
     ``oauth.spend_headroom`` returns ``None`` for an account with no spend
-    data at all, or one whose spend axis is itself capped (pct >= 100) --
-    both excluded here exactly like an account with none, since unknown or
-    capped spend must never be promoted to a rotation target (this
-    machine's own account 2 measured both axes exhausted at once: 7d at
-    100%, overage rejected with ``org_spend_cap_reached`` -- it must stay
-    excluded exactly as it is today).
+    data at all, and at most ``0.0`` for one whose spend axis is capped or
+    whose overage the org rejects outright. The ``> 0.0`` test excludes all
+    three, since unknown, capped and rejected spend must never be promoted
+    to a rotation target (this machine's own account 2 measured both axes
+    exhausted at once: 7d at 100%, and overage at 106% rejected with
+    ``org_spend_cap_reached`` -- it stays excluded whether its usage came
+    from the endpoint or from the header probe that is now the only source
+    that reaches such an account, per issue #220).
     """
     return [
         n

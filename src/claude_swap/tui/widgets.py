@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 from rich.text import Text
 from textual.widgets import ListItem, Static
 
-from claude_swap import pace
+from claude_swap import oauth, pace
 from claude_swap.json_output import USAGE_API_KEY
 from claude_swap.models import AccountSnapshot
 from claude_swap.usage_store import STALE_OK_S
@@ -127,10 +127,10 @@ def usage_rows(
     rows: list[tuple[str, float, str, str]] = []
     spend = last_good.get("spend")
     if spend:
-        amounts = f"${spend['used']:,.2f} / ${spend['limit']:,.2f}"
+        amounts = oauth.spend_amounts(spend)
         reset, reset_full = _reset_parts(spend, now)
-        suffix = f"{reset}  {amounts}" if reset else amounts
-        suffix_full = f"{reset_full}  {amounts}" if reset_full else amounts
+        suffix = "  ".join(part for part in (reset, amounts) if part)
+        suffix_full = "  ".join(part for part in (reset_full, amounts) if part)
         rows.append(("$$", float(spend["pct"]), suffix, suffix_full))
     for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
         window = last_good.get(key)

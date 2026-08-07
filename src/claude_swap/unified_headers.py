@@ -40,6 +40,8 @@ MESSAGES_API_VERSION = "2023-06-01"
 
 _WINDOWS = (("5h", "five_hour"), ("7d", "seven_day"))
 
+_OVERAGE_PREFIX = "anthropic-ratelimit-unified-overage"
+
 
 def _header(headers: Mapping[str, str], name: str) -> str | None:
     """Case-insensitive lookup by header name.
@@ -70,6 +72,56 @@ def _reset_iso(raw: str) -> str | None:
         return None
 
 
+def _overage_extra_usage(headers: Mapping[str, str]) -> dict | None:
+    """The ``extra_usage``-shaped view of the overage headers, or None.
+
+    ``anthropic-ratelimit-unified-overage-utilization`` is the pay-as-you-go
+    spend axis, the one issue #194's last-resort rotation tier runs on. Since
+    issue #220 makes the probe the only usage source for a subscription-
+    exhausted account, and that is precisely the account #194 was written
+    for, the tier could never fire until these headers were mapped: the
+    endpoint's ``extra_usage`` object never reached a probed account.
+
+    Captured live from an account whose subscription window was spent::
+
+        anthropic-ratelimit-unified-overage-status: rejected
+        anthropic-ratelimit-unified-overage-utilization: 1.06
+        anthropic-ratelimit-unified-overage-disabled-reason: org_spend_cap_reached
+
+    Utilization is a fraction like every other unified header, so ``1.06``
+    is 106% and gets scaled the same way the window headers are.
+    ``status`` and ``disabled-reason`` are independent signals, not
+    restatements of the number: an org can reject overage at any
+    utilization, so both travel to ``oauth._spend_entry`` and are honored
+    by ``oauth.spend_headroom`` on their own.
+
+    ``is_enabled`` is True whenever these headers appeared at all, because
+    that is what they prove: the account HAS an overage axis. Whether it can
+    currently serve is what ``status``/``disabled_reason`` answer, and
+    reporting them is the whole point of building the entry for a capped
+    account instead of dropping it. The headers carry no credit amounts, so
+    the entry has no money line -- see ``oauth._spend_entry`` for how that
+    half became optional. None when no utilization header is present or it
+    does not parse: no spend entry then, which callers read as unknown and
+    therefore never as a rotation target.
+    """
+    raw_util = _header(headers, f"{_OVERAGE_PREFIX}-utilization")
+    if raw_util is None:
+        return None
+    try:
+        pct = float(raw_util) * 100
+    except ValueError:
+        return None
+    extra_usage: dict = {"is_enabled": True, "utilization": pct}
+    status = _header(headers, f"{_OVERAGE_PREFIX}-status")
+    if status:
+        extra_usage["status"] = status
+    reason = _header(headers, f"{_OVERAGE_PREFIX}-disabled-reason")
+    if reason:
+        extra_usage["disabled_reason"] = reason
+    return extra_usage
+
+
 def parse_unified_headers(headers: Mapping[str, str]) -> dict | None:
     """Normalize ``anthropic-ratelimit-unified-*`` headers into cswap's usage shape.
 
@@ -79,8 +131,12 @@ def parse_unified_headers(headers: Mapping[str, str]) -> dict | None:
     output is indistinguishable from a real usage-endpoint fetch. A window
     whose ``utilization`` header is missing or unparseable is skipped
     entirely, not defaulted to 0 (which would misreport a window this source
-    never actually saw as an idle one). Returns None when no window
-    survives, matching ``build_usage_result``'s own empty-result contract.
+    never actually saw as an idle one). The pay-as-you-go overage headers
+    ride along as an ``extra_usage`` payload (see
+    :func:`_overage_extra_usage`), so a probed account carries the same
+    ``spend`` entry the endpoint would have produced. Returns None when
+    nothing at all survives, matching ``build_usage_result``'s own
+    empty-result contract.
     """
     endpoint_shaped: dict = {}
     for prefix, key in _WINDOWS:
@@ -98,6 +154,9 @@ def parse_unified_headers(headers: Mapping[str, str]) -> dict | None:
             if resets_at is not None:
                 window["resets_at"] = resets_at
         endpoint_shaped[key] = window
+    overage = _overage_extra_usage(headers)
+    if overage is not None:
+        endpoint_shaped["extra_usage"] = overage
     if not endpoint_shaped:
         return None
     return oauth.build_usage_result(endpoint_shaped)

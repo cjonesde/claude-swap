@@ -158,6 +158,40 @@ class TestSpendHeadroom:
     def test_malformed_pct_is_ignored(self):
         assert oauth.spend_headroom({"spend": {"pct": None}}) is None
 
+    def test_a_rejected_axis_never_reports_positive_headroom(self):
+        """``overage-status`` is an independent signal, not a restatement of
+        the percentage: an org can reject overage at any utilization, and
+        such an account cannot serve the request the last-resort tier would
+        send it."""
+        rejected = {"spend": {"pct": 30.0, "status": "rejected"}}
+        assert oauth.spend_headroom(rejected) == 0.0
+
+    def test_a_disabled_reason_never_reports_positive_headroom(self):
+        """``overage-disabled-reason`` is the second independent signal, and
+        arrives on its own for an org that disabled overage for a reason
+        other than a rejected request."""
+        disabled = {
+            "spend": {"pct": 5.0, "disabled_reason": "org_spend_cap_reached"}
+        }
+        assert oauth.spend_headroom(disabled) == 0.0
+
+    def test_a_capped_and_rejected_axis_keeps_its_measured_deficit(self):
+        """The state measured on this machine's account 2: 106% AND rejected.
+        Clamping must not discard the deficit the number already reports."""
+        both = {
+            "spend": {
+                "pct": 106.0,
+                "status": "rejected",
+                "disabled_reason": "org_spend_cap_reached",
+            }
+        }
+        assert oauth.spend_headroom(both) == -6.0
+
+    def test_an_allowed_status_does_not_clamp(self):
+        assert oauth.spend_headroom(
+            {"spend": {"pct": 30.0, "status": "allowed"}}
+        ) == 70.0
+
 
 class TestRelevantWindows:
     """Test relevant_windows — the canonical window source."""
@@ -425,6 +459,40 @@ class TestFetchUsage:
         assert result is not None
         assert result["five_hour"]["pct"] == 22.0
         assert result["seven_day"]["pct"] == 61.0
+        assert "spend" not in result
+
+    def test_extra_usage_status_only_still_carries_the_spend_axis(self):
+        """The shape the header probe produces: an overage utilization and an
+        explicit status, with no credit amounts to draw a dollar line from.
+        The money line is optional so #194 can reach a probed account at
+        all (issue #220 leaves the probe as its only usage source)."""
+        result = self._fetch_with_response({
+            "seven_day": {"utilization": 100.0, "resets_at": None},
+            "extra_usage": {
+                "is_enabled": True,
+                "utilization": 106.0,
+                "status": "rejected",
+                "disabled_reason": "org_spend_cap_reached",
+            },
+        })
+        assert result["spend"]["pct"] == 106.0
+        assert result["spend"]["status"] == "rejected"
+        assert result["spend"]["disabled_reason"] == "org_spend_cap_reached"
+        assert "used" not in result["spend"]
+
+    def test_extra_usage_percentage_alone_is_still_dropped(self):
+        """A payload whose only fact is a bare percentage, with neither a
+        money line nor an explicit overage state, records nothing -- the
+        endpoint's own partial/unlimited shapes above, unchanged."""
+        result = self._fetch_with_response({
+            "seven_day": {"utilization": 61.0, "resets_at": None},
+            "extra_usage": {
+                "is_enabled": True,
+                "used_credits": None,
+                "monthly_limit": 500000,
+                "utilization": 14.58,
+            },
+        })
         assert "spend" not in result
 
     def test_extra_usage_disabled_keeps_other_rows(self):

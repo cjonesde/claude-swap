@@ -116,10 +116,9 @@ def usage_to_json(usage: dict, fetched_at: float | None = None) -> dict:
     if "spend" in usage:
         spend = usage["spend"]
         spend_out: dict = {
-            "used": spend["used"],
-            "limit": spend["limit"],
-            "pct": spend["pct"],
-            "currency": spend["currency"],
+            key: spend[key]
+            for key in ("used", "limit", "pct", "currency")
+            if key in spend
         }
         if "resets_at" in spend:
             spend_out["resetsAt"] = spend["resets_at"]
