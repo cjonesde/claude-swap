@@ -540,6 +540,31 @@ def account_headroom(
     return 100.0 - max(pcts)
 
 
+def spend_headroom(usage: dict | None) -> float | None:
+    """Remaining percentage before this account's pay-as-you-go spend cap.
+
+    Reads the ``spend`` entry :func:`build_usage_result` derives from
+    ``extra_usage``: ``pct`` there is the utilization the API already
+    reports, over 100 once overage is capped (this machine measured 106%
+    alongside an ``overage-disabled-reason`` of ``org_spend_cap_reached``,
+    so a >=100 reading already means "rejected", not "nearly there" -- no
+    separate capped/disabled signal is consulted or needed). Returns
+    ``None`` when no ``spend`` entry exists, which callers must treat as
+    unknown: never as capped, and never as available. Unlike
+    :func:`account_headroom`, spend is not one of the windows that gates
+    ordinary requests (see that function's docstring); it exists so a
+    caller can ask, as a last resort once every 5h/7d candidate is already
+    at its limit, whether an account can still serve one more request on
+    credit (issue #194).
+    """
+    if not isinstance(usage, dict):
+        return None
+    spend = usage.get("spend")
+    if not isinstance(spend, dict) or not isinstance(spend.get("pct"), (int, float)):
+        return None
+    return 100.0 - float(spend["pct"])
+
+
 @dataclass(frozen=True)
 class UsageOutcome:
     """Result of a usage-API fetch attempt.

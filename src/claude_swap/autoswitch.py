@@ -606,6 +606,36 @@ def _headroom_by_account(
     }
 
 
+def _spend_last_resort_candidates(
+    oauth_candidates: list[str], usage: dict[str, dict | str | None]
+) -> list[str]:
+    """OAuth candidates with pay-as-you-go spend headroom left, for #194.
+
+    ``account_headroom``/``_rank_candidates`` deliberately exclude the
+    spend axis, so a candidate maxed on its 5h/7d subscription windows is
+    filtered out before spend is ever consulted -- correct for the ordinary
+    ranking, which should never prefer a subscription-exhausted account
+    over a healthy one, but wrong for the last-resort question of whether
+    ANYTHING can still serve a request. Meant to be tried only once normal
+    ranking (and the API-key fallback) has already come back empty, so it
+    never outranks a genuinely healthy candidate; it only rescues the
+    "everything is at its limit" case from a false ``AllExhausted``.
+
+    ``oauth.spend_headroom`` returns ``None`` for an account with no spend
+    data at all, or one whose spend axis is itself capped (pct >= 100) --
+    both excluded here exactly like an account with none, since unknown or
+    capped spend must never be promoted to a rotation target (this
+    machine's own account 2 measured both axes exhausted at once: 7d at
+    100%, overage rejected with ``org_spend_cap_reached`` -- it must stay
+    excluded exactly as it is today).
+    """
+    return [
+        n
+        for n in oauth_candidates
+        if (oauth.spend_headroom(usage.get(n)) or 0.0) > 0.0
+    ]
+
+
 class AutoSwitchEngine:
     """Threshold-policy auto-switcher over a :class:`ClaudeAccountSwitcher`.
 
@@ -1186,6 +1216,9 @@ class AutoSwitchEngine:
             # (unmeasurable headroom). Never for a below-threshold consume-first
             # nudge — those API-key accounts have no weekly window to consume.
             ordered = api_key_candidates
+
+        if not ordered and trigger != "consume-first":
+            ordered = _spend_last_resort_candidates(oauth_candidates, usage)
 
         if not ordered:
             if not any_known:

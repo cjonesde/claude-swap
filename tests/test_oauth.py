@@ -124,6 +124,41 @@ class TestAccountHeadroom:
         assert oauth.account_headroom(usage, ["ALL"]) == 3.0
 
 
+class TestSpendHeadroom:
+    """Test spend_headroom -- the pay-as-you-go last-resort axis (#194).
+
+    account_headroom deliberately excludes ``spend`` (test_spend_is_ignored
+    above), so an account maxed on its subscription windows was, until now,
+    unconditionally exhausted even with spend credit still available.
+    spend_headroom answers that one question on its own axis, mirroring
+    account_headroom's shape so callers can treat ">0" as "can still serve
+    one more request" and "<=0" as capped -- the same 100-minus-pct
+    convention, just read from the ``spend`` entry instead of 5h/7d.
+    """
+
+    def test_spend_available_is_headroom(self):
+        assert oauth.spend_headroom({"spend": {"pct": 40.0}}) == 60.0
+
+    def test_spend_capped_is_non_positive(self):
+        # This machine's own account 2, measured: overage-utilization 1.06
+        # (106%) alongside overage-disabled-reason org_spend_cap_reached.
+        assert oauth.spend_headroom({"spend": {"pct": 106.0}}) == -6.0
+
+    def test_spend_exactly_at_cap_is_zero(self):
+        assert oauth.spend_headroom({"spend": {"pct": 100.0}}) == 0.0
+
+    def test_no_spend_entry_is_unknown(self):
+        assert oauth.spend_headroom({"five_hour": {"pct": 50.0}}) is None
+        assert oauth.spend_headroom({}) is None
+
+    def test_none_and_non_dict_are_unknown(self):
+        assert oauth.spend_headroom(None) is None
+        assert oauth.spend_headroom("no credentials") is None
+
+    def test_malformed_pct_is_ignored(self):
+        assert oauth.spend_headroom({"spend": {"pct": None}}) is None
+
+
 class TestRelevantWindows:
     """Test relevant_windows — the canonical window source."""
 

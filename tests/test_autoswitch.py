@@ -3426,7 +3426,12 @@ class TestEveryAccountAboveThreshold:
 
     def test_all_at_limit_still_reports_exhausted(self, harness):
         """h <= 0 is still never a target: with everything truly maxed there
-        is nowhere to go and the exhausted path must still own that case."""
+        is nowhere to go and the exhausted path must still own that case.
+
+        No account here carries any spend data, pinning the #194 fix's third
+        state (unknown spend axis) to this pre-existing, unmodified case:
+        with nothing to consult, behaviour is unchanged from before that fix.
+        """
         outcome = harness.tick_with_usage({
             "1": _usage(100, self._at(harness, 600)),
             "2": _usage(100, self._at(harness, 300)),
@@ -3434,6 +3439,40 @@ class TestEveryAccountAboveThreshold:
         })
         assert outcome is TickOutcome.BLOCKED
         assert harness.active_number() == 1
+
+    def test_last_resort_switches_to_spend_headroom_when_all_at_limit(self, harness):
+        """#194: an account maxed on its subscription windows can still
+        serve requests on pay-as-you-go spend credit. With every candidate
+        at its subscription limit, the one still holding spend headroom
+        must become the last-resort target instead of a false
+        AllExhausted."""
+        usage_2 = _usage(100, self._at(harness, 300))
+        usage_2["spend"] = {"pct": 40.0}
+        outcome = harness.tick_with_usage({
+            "1": _usage(100, self._at(harness, 600)),
+            "2": usage_2,
+            "3": _usage(100, self._at(harness, 900)),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert harness.active_number() == 2
+        assert not any(isinstance(e, AllExhaustedEvent) for e in harness.events)
+
+    def test_spend_capped_account_stays_excluded_when_all_at_limit(self, harness):
+        """#194 guard: a spend axis that is ALSO capped (this machine's real
+        account 2: 7d at 100%, overage-utilization 106%, overage-disabled-
+        reason org_spend_cap_reached) must not be promoted to a last-resort
+        target -- it cannot serve requests on either axis, and picking it
+        would be a worse regression than the bug it fixes."""
+        usage_2 = _usage(100, self._at(harness, 300))
+        usage_2["spend"] = {"pct": 106.0}
+        outcome = harness.tick_with_usage({
+            "1": _usage(100, self._at(harness, 600)),
+            "2": usage_2,
+            "3": _usage(100, self._at(harness, 900)),
+        })
+        assert outcome is TickOutcome.BLOCKED
+        assert harness.active_number() == 1
+        assert any(isinstance(e, AllExhaustedEvent) for e in harness.events)
 
     def test_unknown_reset_sorts_last_not_first(self, harness):
         """A candidate whose reset nobody knows must not masquerade as
