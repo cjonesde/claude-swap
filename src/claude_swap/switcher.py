@@ -2950,6 +2950,7 @@ class ClaudeAccountSwitcher:
                     usage=outcome.usage,
                     error=outcome.error,
                     retry_after_s=outcome.retry_after_s,
+                    rescued_from=outcome.rescued_from,
                 )
             # A locally-valid token the server rejects: revoked out-of-band
             # (measured: a sibling machine rotating a synced lineage kills
@@ -3319,6 +3320,7 @@ class ClaudeAccountSwitcher:
             usage=outcome.usage,
             error=outcome.error,
             retry_after_s=outcome.retry_after_s,
+            rescued_from=outcome.rescued_from,
         )
 
     def _resync_rotated_backup(
@@ -3540,6 +3542,7 @@ class ClaudeAccountSwitcher:
                         usage=outcome.usage,
                         error=outcome.error,
                         retry_after_s=outcome.retry_after_s,
+                        rescued_from=outcome.rescued_from,
                     )
                 if has_live_session:
                     # The live claude refreshes lazily on its next API call;
@@ -3561,6 +3564,7 @@ class ClaudeAccountSwitcher:
             usage=outcome.usage,
             error=outcome.error,
             retry_after_s=outcome.retry_after_s,
+            rescued_from=outcome.rescued_from,
         )
 
     def _run_usage_fetches(
