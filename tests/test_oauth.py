@@ -291,17 +291,12 @@ class TestFetchUsage:
         assert result is None
 
     def test_null_resets_at(self):
-        """When resets_at is null, still return pct without clock/countdown.
-
-        Uses a nonzero five_hour reading: a zero reading with no resets_at is
-        the ambiguous "missing data" shape covered separately by
-        TestFetchUsage's hard-zero tests below (#146), not this contract.
-        """
+        """When resets_at is null, still return pct without clock/countdown."""
         from datetime import timedelta
         fixed_now = datetime(2026, 3, 23, 12, 0, 0, tzinfo=timezone.utc)
         future = fixed_now + timedelta(hours=22)
         response_data = {
-            "five_hour": {"utilization": 45.0, "resets_at": None},
+            "five_hour": {"utilization": 0.0, "resets_at": None},
             "seven_day": {"utilization": 100.0, "resets_at": future.isoformat()},
         }
         mock_response = MagicMock()
@@ -316,58 +311,54 @@ class TestFetchUsage:
             result = oauth.fetch_usage("sk-test-token")
 
         assert result is not None
-        assert result["five_hour"]["pct"] == 45.0
+        assert result["five_hour"]["pct"] == 0.0
         assert "clock" not in result["five_hour"]
         assert "countdown" not in result["five_hour"]
         assert result["seven_day"]["pct"] == 100.0
         assert "clock" in result["seven_day"]
         assert "countdown" in result["seven_day"]
 
-    def test_hard_zero_five_hour_with_no_reset_is_dropped(self):
-        """A 5h window reporting 0% with no resets_at is missing data (#146),
-        not a genuine empty window: a window the API actually knows about
-        always carries its reset time, so this shape is a frozen or
-        otherwise unreadable reading. Recording it at face value let a
-        stale reading masquerade as full headroom and get ranked as a
-        switch target that immediately 429s (measured: both this shape and
-        a genuine reset-bearing zero computed the same headroom, 80.0)."""
+    def test_a_zero_window_with_no_reset_is_real_data(self):
+        """Zero with no resets_at is a reading, not an absence (#146). The
+        premise that live data always carries a reset is contradicted by
+        this repo's own measurement, a 7d window at 95% with no resets_at
+        (see autoswitch._binding_recovery_ts), so keying "missing" on
+        zero-plus-absence dropped live windows."""
         result = self._fetch_with_response({
             "five_hour": {"utilization": 0.0, "resets_at": None},
             "seven_day": {"utilization": 20.0, "resets_at": None},
         })
-        assert result is not None
-        assert "five_hour" not in result
+        assert result["five_hour"]["pct"] == 0.0
         assert result["seven_day"]["pct"] == 20.0
 
-    def test_hard_zero_seven_day_with_no_reset_is_dropped(self):
-        """The same missing-data shape, mirrored onto seven_day: the two
-        windows share one code path in build_usage_result, so the fix must
-        too."""
+    def test_an_idle_account_stays_rankable(self):
+        """The account the drop hurt most: idle for over seven days, so both
+        windows report zero with no resets. Dropping that shape made the
+        whole result None, account_headroom None, and _rank_candidates skip
+        the single best rotation target."""
         result = self._fetch_with_response({
-            "five_hour": {"utilization": 15.0, "resets_at": None},
+            "five_hour": {"utilization": 0.0, "resets_at": None},
             "seven_day": {"utilization": 0.0, "resets_at": None},
         })
-        assert result is not None
-        assert "seven_day" not in result
-        assert result["five_hour"]["pct"] == 15.0
+        assert oauth.account_headroom(result) == 100.0
 
     def test_genuine_zero_with_reset_is_kept(self):
-        """The discriminator is resets_at, not the percentage: a real reset
-        timestamp means the API actually knows this window, so a genuine
-        0% reading is trusted and recorded as usual."""
+        """A zero reading carrying a real reset timestamp is recorded as
+        usual, unchanged by either revision of the #146 predicate."""
         result = self._fetch_with_response({
             "five_hour": {"utilization": 0.0, "resets_at": "2026-08-07T22:00:00Z"},
         })
         assert result["five_hour"]["pct"] == 0.0
 
-    def test_hard_zero_with_no_other_window_is_unknown_headroom(self):
-        """The case that actually matters: a hard-zero 5h reading with no
-        other window data must not score as 100% headroom (#146) -- a
-        frozen endpoint reporting nothing meaningful looked, before this
-        fix, exactly like an account that just reset to fully empty, making
-        a possibly-exhausted account the engine's top switch pick."""
+    def test_a_null_utilization_window_is_unknown_headroom(self):
+        """The endpoint's real missing-data encoding: ``utilization: null``
+        alongside a reset time. It must read as unknown, never as free
+        capacity -- that is the #146 failure mode, keyed this time on the
+        signal the API actually sends."""
         result = self._fetch_with_response({
-            "five_hour": {"utilization": 0.0, "resets_at": None},
+            "five_hour": {
+                "utilization": None, "resets_at": "2026-08-07T22:00:00Z"
+            },
         })
         assert oauth.account_headroom(result) is None
 
