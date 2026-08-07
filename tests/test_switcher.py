@@ -981,7 +981,9 @@ class TestListAccountsUsage:
     def test_list_shows_usage_null_reset(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, capsys
     ):
-        """When five_hour.resets_at is null and seven_day is at 100%, display both correctly."""
+        """A hard-zero five_hour (0% with no resets_at) is missing data
+        (#146), so it is dropped rather than displayed as a confident 0%;
+        seven_day, which carries a real reset, still displays normally."""
         sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
         active_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
         backup_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-backup"}})
@@ -1005,7 +1007,7 @@ class TestListAccountsUsage:
             switcher.list_accounts()
 
         output = capsys.readouterr().out
-        assert "5h:   0%" in output
+        assert "5h:" not in output
         assert "7d: 100%" in output
         assert "usage unavailable" not in output
 

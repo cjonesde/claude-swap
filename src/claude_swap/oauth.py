@@ -396,13 +396,25 @@ def _log_usage_failure(
 
 
 def build_usage_result(data: dict) -> dict | None:
-    """Normalize raw usage API data into the structure used by the CLI."""
+    """Normalize raw usage API data into the structure used by the CLI.
+
+    A window reporting exactly 0% utilization with no ``resets_at`` is
+    dropped rather than recorded as a genuine empty window (issue #146): a
+    window the API actually has live data for always carries its reset
+    time, so zero-with-no-reset is a frozen or otherwise unreadable
+    response, not proof the account is fully free. Recording it at face
+    value let a stale reading masquerade as full headroom and get ranked as
+    a switch target that immediately 429s (measured: a hard-zero and a
+    genuine reset-bearing zero both computed the same 80.0 headroom, since
+    nothing distinguished them). A genuine 0% reading, one that carries a
+    real ``resets_at``, is unaffected and still recorded normally.
+    """
     _logger.debug("Usage API response: %s", json.dumps(data, indent=2))
 
     result = {}
 
     h5 = data.get("five_hour")
-    if h5:
+    if h5 and not (h5["utilization"] == 0 and not h5.get("resets_at")):
         h5_entry = {"pct": h5["utilization"]}
         if h5.get("resets_at"):
             h5_entry["resets_at"] = h5["resets_at"]
@@ -410,7 +422,7 @@ def build_usage_result(data: dict) -> dict | None:
         result["five_hour"] = h5_entry
 
     d7 = data.get("seven_day")
-    if d7:
+    if d7 and not (d7["utilization"] == 0 and not d7.get("resets_at")):
         d7_entry = {"pct": d7["utilization"]}
         if d7.get("resets_at"):
             d7_entry["resets_at"] = d7["resets_at"]
