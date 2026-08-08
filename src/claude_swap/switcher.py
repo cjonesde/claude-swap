@@ -86,7 +86,12 @@ from claude_swap.paths import (
 )
 from claude_swap.process_detection import get_running_instances
 from claude_swap import poll_policy
-from claude_swap.settings import load_settings, parse_model_names, settings_path
+from claude_swap.settings import (
+    load_settings,
+    load_usage_settings,
+    parse_model_names,
+    settings_path,
+)
 from claude_swap.usage_store import (
     FetchRecord,
     UsageEntry,
@@ -1657,6 +1662,18 @@ class ClaudeAccountSwitcher:
         self._poll_inputs_cache = (mtime, inputs)
         return inputs
 
+    def _header_fallback_enabled(self) -> bool:
+        """Whether a 429'd usage fetch may fall back to the header probe.
+
+        ``usage.headerFallback`` (default on). The probe answers issue #220 on
+        the accounts the usage endpoint refuses, and it spends about 10 tokens
+        of that account's own subscription quota to do it, so a user must be
+        able to turn it off. Read here rather than in ``oauth`` because every
+        surface -- list, status, the TUI, the menu bar, auto -- fetches through
+        this class.
+        """
+        return load_usage_settings(self.backup_dir).header_fallback
+
     def switchable_account_numbers(self) -> list[str]:
         """Account numbers in rotation order eligible for automatic selection.
 
@@ -2920,6 +2937,7 @@ class ClaudeAccountSwitcher:
         if not oauth.is_oauth_token_expired(oauth_data.get("expiresAt")):
             outcome = oauth.try_fetch_usage_for_account(
                 account_num, email, creds, is_active=True,
+                header_fallback=self._header_fallback_enabled(),
             )
             if outcome.error != "http-401":
                 if outcome.usage is not None:
@@ -3319,6 +3337,7 @@ class ClaudeAccountSwitcher:
 
         outcome = oauth.try_fetch_usage_for_account(
             account_num, email, working, is_active=True,
+            header_fallback=self._header_fallback_enabled(),
         )
         return FetchRecord(
             usage=outcome.usage,
@@ -3541,6 +3560,7 @@ class ClaudeAccountSwitcher:
                 if not oauth.is_oauth_token_expired(session_oauth.get("expiresAt")):
                     outcome = oauth.try_fetch_usage_for_account(
                         str(num), email, session_creds, is_active=True,
+                        header_fallback=self._header_fallback_enabled(),
                     )
                     return FetchRecord(
                         usage=outcome.usage,
@@ -3563,6 +3583,7 @@ class ClaudeAccountSwitcher:
             str(num), email, creds,
             is_active=has_live_session,
             persist_credentials=persist,
+            header_fallback=self._header_fallback_enabled(),
         )
         return FetchRecord(
             usage=outcome.usage,
