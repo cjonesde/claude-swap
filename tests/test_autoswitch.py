@@ -3489,6 +3489,7 @@ class TestEveryAccountAboveThreshold:
         not fire in the one scenario it was written for. Header values are
         fractions: 0.3 is 30% of the credit spent, 70 points left."""
         probed = parse_unified_headers({
+            "anthropic-ratelimit-unified-5h-utilization": "1.0",
             "anthropic-ratelimit-unified-7d-utilization": "1.0",
             "anthropic-ratelimit-unified-overage-status": "allowed",
             "anthropic-ratelimit-unified-overage-utilization": "0.3",
@@ -3505,6 +3506,7 @@ class TestEveryAccountAboveThreshold:
         on both axes, so it cannot serve the request a switch would send it,
         and selecting it would be worse than the dead-tier bug."""
         probed = parse_unified_headers({
+            "anthropic-ratelimit-unified-5h-utilization": "1.0",
             "anthropic-ratelimit-unified-7d-utilization": "1.0",
             "anthropic-ratelimit-unified-overage-status": "rejected",
             "anthropic-ratelimit-unified-overage-utilization": "1.06",
@@ -3523,6 +3525,7 @@ class TestEveryAccountAboveThreshold:
         overage. Reading the percentage alone would rotate work onto an
         account the server refuses."""
         probed = parse_unified_headers({
+            "anthropic-ratelimit-unified-5h-utilization": "1.0",
             "anthropic-ratelimit-unified-7d-utilization": "1.0",
             "anthropic-ratelimit-unified-overage-status": "rejected",
             "anthropic-ratelimit-unified-overage-utilization": "0.3",
@@ -3535,6 +3538,7 @@ class TestEveryAccountAboveThreshold:
         """The third state: no spend data at all. Unknown must stay unknown,
         so behaviour matches the pre-#194 exhausted path exactly."""
         probed = parse_unified_headers({
+            "anthropic-ratelimit-unified-5h-utilization": "1.0",
             "anthropic-ratelimit-unified-7d-utilization": "1.0",
         })
         assert oauth.spend_headroom(probed) is None
