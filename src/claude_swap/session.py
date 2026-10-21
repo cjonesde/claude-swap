@@ -16,8 +16,8 @@ would couple us to Claude's internal storage format and naming, where a
 mismatch is a hard "logged out" failure instead of a harmless stale entry.
 
 Sharing: by default the user's ``settings.json``, ``keybindings.json``,
-``CLAUDE.md``, ``skills/``, ``commands/``, and ``agents/`` follow them into
-the session profile — symlinks on macOS/Linux (Claude's settings writer
+``CLAUDE.md``, ``skills/``, ``commands/``, ``agents/``, and ``rules/`` follow
+them into the session profile — symlinks on macOS/Linux (Claude's settings writer
 detects symlinks and writes through to the target, so in-session ``/config``
 changes land in ``~/.claude``), copies re-synced on every launch on Windows.
 A manifest records what cswap created so removal never touches user data.
@@ -42,7 +42,6 @@ import os
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
 import unicodedata
 from pathlib import Path
@@ -55,7 +54,7 @@ from claude_swap.exceptions import (
     CredentialReadError,
     SessionError,
 )
-from claude_swap.fsutil import replace_with_retry
+from claude_swap.fsutil import atomic_write_text
 from claude_swap.locking import FileLock
 from claude_swap.models import Platform
 from claude_swap.paths import get_default_global_config_path
@@ -80,6 +79,7 @@ SHARED_ITEMS = (
     "skills",
     "commands",
     "agents",
+    "rules",
 )
 
 # Conversation-history items linked additionally under --share-history.
@@ -305,13 +305,14 @@ def _may_have_credential_material(session_dir: Path) -> bool:
         pass  # no readable seed — the keychain may still hold the material
     if Platform.detect() != Platform.MACOS:
         return False
-    try:
-        material = macos_keychain.get_password(
-            keychain_service_name(session_dir), _keychain_account_name()
-        )
-    except macos_keychain.KEYCHAIN_ERRORS:
-        return True  # unreadable is not absent: preserve the profile
-    return material is not None
+    for service in _keychain_services(str(session_dir)):
+        try:
+            material = macos_keychain.get_password(service, _keychain_account_name())
+        except macos_keychain.KEYCHAIN_ERRORS:
+            return True  # unreadable is not absent: preserve the profile
+        if material is not None:
+            return True
+    return False
 
 
 def _artifacts_say_usable(session_dir: Path, email: str, org_uuid: str) -> bool:
@@ -334,6 +335,62 @@ def _artifacts_say_usable(session_dir: Path, email: str, org_uuid: str) -> bool:
 # (credentials._ACTIVE_READ_ATTEMPTS / _ACTIVE_READ_RETRY_DELAY).
 _STRICT_KEYCHAIN_ATTEMPTS = 2
 _STRICT_KEYCHAIN_RETRY_DELAY = 0.3  # seconds between attempts
+
+
+def _keychain_services(config_dir: str, override: str | None = None) -> list[str]:
+    """Keychain service names that may hold a profile's credential, in
+    lookup order.
+
+    Claude hashes the exported ``CLAUDE_CONFIG_DIR`` verbatim, so a profile
+    that is a symlink was launched under one of two names: its own path, or
+    the target's, when a tool launches claude at the target directly and
+    keeps the per-account symlink as its bookkeeping (a lease). Reading only
+    the link's name would miss every rotation claude wrote under the
+    target's and serve the plaintext seed left behind, which is how a leased
+    profile's usage silently froze at the last pre-rotation measurement. The
+    profile's own name is tried first, then the target's. A relative target
+    is joined onto the link's parent and tried in two spellings, likeliest
+    first: the lexical form with ``..`` collapsed (``/x/space``, what a tool
+    launching at the target usually exports), offered only when it names the
+    link's own directory — under a parent that is itself a symlink elsewhere
+    it can name an unrelated directory with its own entry — and then the raw
+    join (``/x/sessions/../space``, what ``$(dirname link)/$(readlink link)``
+    exports). ``override`` names the unsuffixed default-profile item and
+    stands alone.
+    """
+    if override is not None:
+        return [override]
+    services = [keychain_service_name(config_dir)]
+    try:
+        target = os.readlink(config_dir)
+    except OSError:
+        return services
+    if os.path.isabs(target):
+        services.append(keychain_service_name(target))
+        return services
+    raw = os.path.join(os.path.dirname(config_dir), target)
+    lexical = os.path.normpath(raw)
+    try:
+        if lexical != raw and os.path.samefile(lexical, raw):
+            services.append(keychain_service_name(lexical))
+    except OSError:
+        pass  # nothing at the lexical path: not a spelling of this directory
+    services.append(keychain_service_name(raw))
+    return services
+
+
+def _keychain_entry(service: str, strict: bool) -> str | None:
+    """One service's item, or ``None`` when absent (rc 44). An unreadable
+    keychain is retried once under ``strict`` and then raised as it stands."""
+    attempts = _STRICT_KEYCHAIN_ATTEMPTS if strict else 1
+    while True:
+        try:
+            return macos_keychain.get_password(service, _keychain_account_name())
+        except macos_keychain.KEYCHAIN_ERRORS:
+            attempts -= 1
+            if not attempts:
+                raise
+            time.sleep(_STRICT_KEYCHAIN_RETRY_DELAY)
 
 
 def read_config_dir_credentials(
@@ -360,23 +417,20 @@ def read_config_dir_credentials(
     The seed may predate an in-profile ``/login``, and capturing it would file
     one account's email against another's token — the very mismatch the capture
     path exists to prevent. An *absent* entry (rc 44) still falls back either
-    way: absence is claude's own signal to read the file.
+    way: absence is claude's own signal to read the file. For a symlinked
+    profile that fallback includes the target's entry under both modes, on
+    purpose: it is the newest generation claude wrote for that directory,
+    and the seed it would otherwise capture is the one claude stopped
+    updating when it first wrote the keychain.
     """
     directory = Path(config_dir)
     if not directory.is_dir():
         return None
     if Platform.detect() == Platform.MACOS:
-        attempts = _STRICT_KEYCHAIN_ATTEMPTS if strict_keychain else 1
-        for attempt in range(attempts):
+        for service in _keychain_services(config_dir, keychain_service):
             try:
-                creds = macos_keychain.get_password(
-                    keychain_service or keychain_service_name(config_dir),
-                    _keychain_account_name(),
-                )
+                creds = _keychain_entry(service, strict_keychain)
             except macos_keychain.KEYCHAIN_ERRORS as e:
-                if attempt + 1 < attempts:
-                    time.sleep(_STRICT_KEYCHAIN_RETRY_DELAY)
-                    continue
                 if strict_keychain:
                     raise CredentialReadError(
                         f"Keychain entry for profile {config_dir} is unreadable "
@@ -385,7 +439,7 @@ def read_config_dir_credentials(
                 break  # best-effort read: the plaintext seed is the next-best truth
             if creds:
                 return creds
-            break  # entry absent (rc 44) — claude's own signal to read the file
+            # entry absent (rc 44) — claude's own signal to look further
     try:
         return (directory / ".credentials.json").read_text(encoding="utf-8")
     except (OSError, ValueError):
@@ -432,7 +486,10 @@ def session_identity_drifted(session_dir: Path, email: str, org_uuid: str) -> bo
     ``_is_session_valid``: the email must match, the org only when both sides
     have a value. An unreadable identity is NOT drift — missing metadata
     degrades to trusting the profile (its token family is normally the slot's
-    freshest) rather than abandoning it over a broken ``.claude.json``.
+    freshest) rather than abandoning it over a broken ``.claude.json``. That
+    is a read-side policy: ``_adopt_session_credential``, which writes the
+    profile's credential into the backup, requires ``read_session_identity``
+    to succeed on top of this.
     """
     identity = read_session_identity(session_dir)
     if identity is None:
@@ -507,8 +564,16 @@ class SessionManager:
         claude_args: list[str],
         share: bool = True,
         share_history: bool = False,
+        require_session: bool = False,
     ) -> NoReturn:
-        """Launch Claude Code as the given account in the current terminal."""
+        """Launch Claude Code as the given account in the current terminal.
+
+        ``require_session`` turns the same-account fast path (a plain claude
+        launch on the default login) into a refusal: a wrapper that hands a
+        terminal to one account per session needs the isolation guaranteed,
+        and a session on the default login is the one thing an account
+        switch can later pull out from under it.
+        """
         claude_bin = shutil.which("claude")
         if not claude_bin:
             raise SessionError(
@@ -542,6 +607,15 @@ class SessionManager:
             # refresh token.
             current = self.switcher._get_current_account()
             if current is not None and current == (email, org_uuid):
+                if require_session:
+                    raise SessionError(
+                        f"Account-{account_num} ({email}) is the active default "
+                        "login, so this launch would run plain claude on the "
+                        "default login rather than in a session profile (a "
+                        "second copy of the active credential would drift). "
+                        "Switch the default login to another account first, "
+                        "or run `claude` directly."
+                    )
                 print(
                     dimmed(
                         f"Account-{account_num} ({email}) is already the active "
@@ -852,9 +926,7 @@ class SessionManager:
             os.chmod(session_dir, 0o700)
 
         creds_path = session_dir / ".credentials.json"
-        creds_path.write_text(creds, encoding="utf-8")
-        if sys.platform != "win32":
-            os.chmod(creds_path, 0o600)
+        atomic_write_text(creds_path, creds)
 
         # Merge the identity seed into any existing .claude.json so a
         # re-bootstrap preserves the profile's own projects/history. The
@@ -870,9 +942,7 @@ class SessionManager:
         existing["oauthAccount"] = oauth_account
         existing["hasCompletedOnboarding"] = True
         existing.setdefault("theme", config_data.get("theme") or "dark")
-        config_path.write_text(json.dumps(existing, indent=2), encoding="utf-8")
-        if sys.platform != "win32":
-            os.chmod(config_path, 0o600)
+        atomic_write_text(config_path, json.dumps(existing, indent=2))
 
         self._logger.info(
             f"Bootstrapped session profile for account {account_num} at {session_dir}"
@@ -1422,18 +1492,10 @@ class SessionManager:
     def _write_manifest(self, manifest_path: Path, items: list[str]) -> None:
         mode = "symlink" if self.switcher.platform != Platform.WINDOWS else "copy"
         payload = json.dumps({"items": items, "mode": mode}, indent=2)
-        fd, tmp = tempfile.mkstemp(
-            dir=str(manifest_path.parent), prefix=".cswap-shared-", suffix=".tmp"
-        )
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(payload)
-            replace_with_retry(tmp, manifest_path)
+            atomic_write_text(manifest_path, payload)
         except OSError:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
+            pass  # best effort: a failed manifest must not fail a launch
 
     @staticmethod
     def _remove_managed(dest: Path) -> None:
